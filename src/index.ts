@@ -31,7 +31,8 @@ import packageJson from '../package.json' with { type: 'json' };
 const isWindows = os.platform() === 'win32';
 
 const APP_URL = process.env.APP_URL || 'https://app.httptoolkit.tech';
-const hasTrustedOrigin = (url: URL) => url.origin === APP_URL;
+const TRUSTED_ORIGIN = new URL(APP_URL).origin;
+const hasTrustedOrigin = (url: URL) => url.origin === TRUSTED_ORIGIN;
 
 const AUTH_TOKEN = crypto.randomBytes(20).toString('base64url');
 const DESKTOP_VERSION = packageJson.version;
@@ -112,10 +113,15 @@ const createWindow = () => {
         return callback(hasTrustedOrigin(pageUrl));
     });
 
-    window.loadURL(APP_URL + '?' + querystring.stringify({
-        authToken: AUTH_TOKEN,
-        desktopVersion: DESKTOP_VERSION
-    }));
+    // In dev, the UI and server are started separately; don't inject a desktop-only
+    // auth token that won't match the external server process.
+    window.loadURL(DEV_MODE
+        ? APP_URL
+        : APP_URL + '?' + querystring.stringify({
+            authToken: AUTH_TOKEN,
+            desktopVersion: DESKTOP_VERSION
+        })
+    );
 
     window.on('ready-to-show', function () {
         window!.show();
@@ -611,19 +617,21 @@ if (!amMainInstance) {
             return undefined;
         });
 
-    Promise.all([
-        cleanupOldServers().catch(console.log),
-        portsInUseCheck,
-        reservedPortCheck
-    ]).then(() =>
-        startServer()
-    ).catch((err) => {
-        console.error('Failed to start server, exiting.', err);
+    if (!DEV_MODE) {
+        Promise.all([
+            cleanupOldServers().catch(console.log),
+            portsInUseCheck,
+            reservedPortCheck
+        ]).then(() =>
+            startServer()
+        ).catch((err) => {
+            console.error('Failed to start server, exiting.', err);
 
-        // Hide immediately, shutdown entirely after a brief pause for Sentry
-        windows.forEach(window => window.hide());
-        setTimeout(() => process.exit(3), 500);
-    });
+            // Hide immediately, shutdown entirely after a brief pause for Sentry
+            windows.forEach(window => window.hide());
+            setTimeout(() => process.exit(3), 500);
+        });
+    }
 
     Promise.all([appReady.promise, portsInUseCheck, reservedPortCheck]).then(() => {
         Menu.setApplicationMenu(getMenu(windows, openNewWindow));
