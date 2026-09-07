@@ -22,9 +22,11 @@ import { getDeferred } from '@httptoolkit/util';
 
 import { getMenu, shouldAutoHideMenu } from './menu.ts';
 import { ContextMenuDefinition, openContextMenu } from './context-menu.ts';
+import getPort, { portNumbers } from 'get-port';
+
 import { stopServer } from './stop-server.ts';
+import { shouldClearStaleUICache, clearUICache, recordUIRun } from './cache-cleanup.ts';
 import { getDeviceDetails } from './device.ts';
-import { SERVER_PORTS, checkPortsInUse, checkWindowsReservedPorts } from './port-checks.ts';
 
 import packageJson from '../package.json' with { type: 'json' };
 
@@ -53,6 +55,28 @@ const LAST_RUN_LOG_PATH = path.join(LOGS_PATH, 'last-run.log');
 let windows: Electron.BrowserWindow[] = [];
 
 let server: ChildProcess | null = null;
+
+interface ServerPorts {
+    serverPort: number;
+    mockttpPort: number;
+}
+
+// Port range outside ephemeral, so unlikely to race externally during the
+// (near) inevitable TOCTOU as we pass the port config to the server.
+const SERVER_PORT_RANGE_START = 28000;
+const SERVER_PORT_RANGE_END = 29999;
+
+const pickServerPorts = async (): Promise<ServerPorts> => {
+    const [serverPort, mockttpPort] = await Promise.all([
+        getPort({ port: portNumbers(SERVER_PORT_RANGE_START, SERVER_PORT_RANGE_END) }),
+        getPort({ port: portNumbers(SERVER_PORT_RANGE_START, SERVER_PORT_RANGE_END) })
+    ]);
+    return { serverPort, mockttpPort };
+};
+
+// Resolved before any window or server is started, to inject into the renderer
+// synchronously via additionalArguments and into the server via CLI flags.
+let serverPorts: ServerPorts;
 
 app.commandLine.appendSwitch('ignore-connections-limit', 'app.httptoolkit.tech');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
@@ -86,7 +110,15 @@ const createWindow = () => {
         webPreferences: {
             preload: path.join(import.meta.dirname, 'preload.cjs'),
             contextIsolation: true,
-            nodeIntegration: false
+            nodeIntegration: false,
+            // Pass startup-time values into the preload synchronously, so the
+            // UI can read them via desktopApi getters without awaiting IPC.
+            additionalArguments: [
+                `--htk-desktop-version=${DESKTOP_VERSION}`,
+                `--htk-server-auth-token=${AUTH_TOKEN}`,
+                `--htk-server-port=${serverPorts.serverPort}`,
+                `--htk-mockttp-port=${serverPorts.mockttpPort}`
+            ]
         },
 
         show: false
@@ -153,10 +185,17 @@ const getLogStream = () => {
 };
 
 const writeLog = (message: string) => {
-    getLogStream().write(message + '\n');
+    const stream = getLogStream();
+    if (stream.closed) return;
+    stream.write(message + '\n');
 }
 
-const openNewWindow = () => appReady.promise.then(() => createWindow());
+// Resolved once serverPorts is populated, after the main-instance branch
+// initialises it. createWindow reads serverPorts to seed additionalArguments.
+const portsResolved = getDeferred<ServerPorts>();
+
+const openNewWindow = () => Promise.all([appReady.promise, portsResolved.promise])
+    .then(() => createWindow());
 
 const amMainInstance = app.requestSingleInstanceLock();
 if (!amMainInstance) {
@@ -179,7 +218,7 @@ if (!amMainInstance) {
             serverKilled = true;
 
             try {
-                await stopServer(server, AUTH_TOKEN);
+                await stopServer(server, AUTH_TOKEN, serverPorts.serverPort);
             } catch (error) {
                 console.log('Failed to kill server', error);
                 logError(error);
@@ -222,8 +261,12 @@ if (!amMainInstance) {
         contents.on('will-navigate', (event: Electron.Event, navigationUrl: string) => {
             const parsedUrl = new URL(navigationUrl);
 
-            checkForUnsafeNavigation(parsedUrl);
-            if (!hasTrustedOrigin(parsedUrl)) {
+            if (!checkForUnsafeProtocol(parsedUrl)) {
+                console.warn(`Blocked navigation to unsafe url: ${navigationUrl}`);
+                event.preventDefault();
+                // Don't open the URL. Concern here is things like 'file' which
+                // could launch an exe or similar.
+            } else if (!hasTrustedOrigin(parsedUrl)) {
                 event.preventDefault();
                 handleExternalNavigation(parsedUrl);
             }
@@ -231,8 +274,10 @@ if (!amMainInstance) {
         contents.setWindowOpenHandler((openDetails) => {
             const parsedUrl = new URL(openDetails.url);
 
-            checkForUnsafeNavigation(parsedUrl);
-            if (!hasTrustedOrigin(parsedUrl)) {
+            if (!checkForUnsafeProtocol(parsedUrl)) {
+                console.warn(`Blocked window open for unsafe url: ${openDetails.url}`);
+                return { action: 'deny' };
+            } else if (!hasTrustedOrigin(parsedUrl)) {
                 handleExternalNavigation(parsedUrl);
                 return { action: 'deny' };
             } else {
@@ -250,7 +295,7 @@ if (!amMainInstance) {
             );
 
             setImmediate(() => {
-                contents.reload();
+                if (!contents.isDestroyed()) contents.reload();
             });
         });
 
@@ -274,17 +319,17 @@ if (!amMainInstance) {
             );
 
             setTimeout(() => {
-                contents.reload();
+                if (!contents.isDestroyed()) contents.reload();
             }, 2000);
         });
     });
 
-    function checkForUnsafeNavigation(url: URL) {
+    function checkForUnsafeProtocol(url: URL) {
         if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-            // This suggests an attempted XSS attack of some sort, report it:
-            const error = new Error(`Attempt to open a dangerous non-HTTP url: ${url}`);
-            throw error;
+            console.warn(`Attempt to open a non-HTTP url: ${url}`);
+            return false;
         }
+        return true;
     }
 
     function handleExternalNavigation(url: URL) {
@@ -294,7 +339,6 @@ if (!amMainInstance) {
                     "Failed to open URL",
                     `HTTP Toolkit could not open ${url.toString()} in your browser, because: ${error?.message ?? error ?? 'unknown error'}`
                 );
-                throw error;
             });
     }
 
@@ -411,7 +455,13 @@ if (!amMainInstance) {
                 ].join(' ')
         }
 
-        server = spawn(serverBinCommand, ['start'], {
+        const serverArgs = [
+            'start',
+            '--server-port', String(serverPorts.serverPort),
+            '--mockttp-port', String(serverPorts.mockttpPort)
+        ];
+
+        server = spawn(serverBinCommand, serverArgs, {
             windowsHide: true,
             stdio: ['inherit', 'pipe', 'pipe'],
             shell: isWindows, // Required to spawn a .cmd script
@@ -492,7 +542,9 @@ if (!amMainInstance) {
             // Retry limited times, but not for near-immediate failures.
             if (retries > 0 && serverRunTime > 5000) {
                 // This will break the app, so refresh it
-                windows.forEach(window => window.reload());
+                windows.forEach(window => {
+                    if (!window.isDestroyed()) window.reload();
+                });
                 return startServer(retries - 1);
             }
 
@@ -521,48 +573,6 @@ if (!amMainInstance) {
         // Overwrite it for our purposes anyway, to try to minimize breakage:
         process.env.COMSPEC = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
     }
-
-    // Check if our required ports are already in use by another process
-    const portsInUseCheck = checkPortsInUse('127.0.0.1', [...SERVER_PORTS])
-        .then(async (portsInUse) => {
-            if (portsInUse.length === 0) return;
-            if (DEV_MODE) return; // In full dev mode this is OK & expected
-
-            await appReady.promise;
-
-            const portList = portsInUse.join(', ');
-            showErrorAlert(
-                "HTTP Toolkit could not start",
-                `HTTP Toolkit's required port${portsInUse.length > 1 ? 's' : ''} (${portList}) ` +
-                `${portsInUse.length > 1 ? 'are' : 'is'} already in use.\n\n` +
-                "Do you have another HTTP Toolkit process running somewhere?\n" +
-                "Please close the other process using this port, and try again.\n\n" +
-                "(Having trouble? File an issue at github.com/httptoolkit/httptoolkit)"
-            );
-
-            process.exit(2);
-        });
-
-    // On Windows, check if Hyper-V/WSL has reserved our ports (separate from 'in use' above)
-    const reservedPortCheck = checkWindowsReservedPorts([...SERVER_PORTS])
-        .then(async (reservedPorts) => {
-            if (reservedPorts.length === 0) return;
-            if (DEV_MODE) return;
-
-            await appReady.promise;
-
-            const portList = reservedPorts.join(', ');
-            await showErrorAlert(
-                "HTTP Toolkit could not start",
-                `HTTP Toolkit's required port${reservedPorts.length > 1 ? 's' : ''} (${portList}) ` +
-                `${reservedPorts.length > 1 ? 'have' : 'has'} been reserved by Windows.\n\n` +
-                "This is usually caused by Hyper-V or WSL reserving ports for its own use. " +
-                "This can be fixed by adjusting your Windows network configuration.",
-                "https://httptoolkit.com/docs/guides/troubleshooting/#http-toolkit-conflicts-with-hyper-v"
-            );
-
-            process.exit(2);
-        });
 
     // Check we're happy using the default proxy settings
     getSystemProxy()
@@ -617,23 +627,56 @@ if (!amMainInstance) {
             return undefined;
         });
 
-    if (!DEV_MODE) {
-        Promise.all([
-            cleanupOldServers().catch(console.log),
-            portsInUseCheck,
-            reservedPortCheck
-        ]).then(() =>
-            startServer()
-        ).catch((err) => {
-            console.error('Failed to start server, exiting.', err);
+    cleanupOldServers().catch(console.log).then(async () => {
+        // N.b. we pick the ports as late as possible to limit TOCTOU window
+        const ports = DEV_MODE
+            ? { serverPort: 45457, mockttpPort: 45456 }
+            : await pickServerPorts();
+        serverPorts = ports;
+        portsResolved.resolve(ports);
 
-            // Hide immediately, shutdown entirely after a brief pause for Sentry
-            windows.forEach(window => window.hide());
-            setTimeout(() => process.exit(3), 500);
+        return startServer();
+    }).catch((err) => {
+        console.error('Failed to start server, exiting.', err);
+
+        // Hide immediately, shutdown entirely after a brief pause for Sentry
+        windows.forEach(window => window.hide());
+        setTimeout(() => process.exit(3), 500);
+    });
+
+    // Decide whether we need to reset the UI cache (desktop upgrade + outdated UI)
+    const userDataPath = app.getPath('userData');
+    const cacheDecision: Promise<boolean> = DEV_MODE
+        ? Promise.resolve(false)
+        : shouldClearStaleUICache({
+            userDataPath,
+            currentVersion: DESKTOP_VERSION,
+            log: writeLog,
+            reportError: logError
         });
+
+    // If so, we clear before the first window loads, so a stale service worker isn't reused. Clearing
+    // must not block launch though: on failure we log, leave the cache in place and carry on.
+    const uiCacheReady = Promise.all([appReady.promise, cacheDecision])
+        .then(async ([, shouldClear]) => {
+            if (shouldClear) await clearUICache(session.defaultSession);
+        })
+        .catch((error) => {
+            writeLog(`Failed to clear UI cache: ${error}`);
+            logError(error);
+        });
+
+    // Record last-run info async (used for the outdated cache checks above in future runs):
+    if (!DEV_MODE) {
+        Promise.all([appReady.promise, cacheDecision])
+            .then(() => recordUIRun(userDataPath, DESKTOP_VERSION))
+            .catch((error) => {
+                writeLog(`Failed to record desktop run: ${error}`);
+                logError(error);
+            });
     }
 
-    Promise.all([appReady.promise, portsInUseCheck, reservedPortCheck]).then(() => {
+    Promise.all([appReady.promise, portsResolved.promise, uiCacheReady]).then(() => {
         Menu.setApplicationMenu(getMenu(windows, openNewWindow));
         createWindow();
     });
@@ -663,9 +706,9 @@ if (!amMainInstance) {
 // 3rd party sites) but it's good practice for defense-in-depth etc. We allow calls with an empty URL
 // because the preload script fires IPC invocations before navigation completes, so the frame URL is
 // not yet set at that point.
-const ipcHandler = <A, R>(fn: (...args: A[]) => R) => (
+const ipcHandler = <A extends any[], R>(fn: (...args: A) => R) => (
     event: Electron.IpcMainInvokeEvent,
-    ...args: A[]
+    ...args: A
 ): R => {
     if (!event.senderFrame) {
         throw new Error('IPC call from destroyed frame');
@@ -716,8 +759,6 @@ ipcMain.handle('open-context-menu', ipcHandler((options: ContextMenuDefinition) 
     openContextMenu(options)
 ));
 
-ipcMain.handle('get-desktop-version', ipcHandler(() => DESKTOP_VERSION));
-ipcMain.handle('get-server-auth-token', ipcHandler(() => AUTH_TOKEN));
 ipcMain.handle('get-device-info', ipcHandler(() => getDeviceDetails()));
 
 ipcMain.handle('set-component-versions', ipcHandler((versions: Record<string, string>) => {

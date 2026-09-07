@@ -39,7 +39,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 24.15.0
+          node-version: 24.19.0
           check-latest: true
           cache: 'npm'
 
@@ -63,7 +63,7 @@ jobs:
 
       - name: Azure login for Windows signing
         if: env.IS_RELEASE == 'true' && matrix.platform == 'windows'
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -95,6 +95,15 @@ jobs:
           ENABLE_SIGNING: false
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           USE_SYSTEM_FPM: ${{ matrix.platform == 'linux' && matrix.arch == 'arm64' }}
+
+      # Attempt to fix flaky tests due to CI disk perf by warming the disk up
+      - name: Warm page cache before smoke tests
+        if: runner.os == 'Linux'
+        run: |
+          for d in node_modules httptoolkit-server build; do
+            [ -e "$d" ] && find "$d" -type f -print0 2>/dev/null | xargs -0 cat > /dev/null 2>&1 || true
+          done
+        shell: bash
 
       - name: Run smoke tests
         run: |
@@ -202,14 +211,17 @@ jobs:
           gh repo sync "$forkOwner/winget-pkgs" --source microsoft/winget-pkgs
 
       - name: Submit package using wingetcreate
+        # winget-create will read the following environment variable to access the GitHub token needed for submitting a PR
+        # See https://aka.ms/winget-create-token
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
         run: |
           $packageVersion = "${{ github.ref }}" -replace 'refs/tags/v', ''
           $installerUrl = "https://github.com/httptoolkit/httptoolkit-desktop/releases/download/v$packageVersion/HttpToolkit-$packageVersion.exe"
 
           # Update package using wingetcreate
-          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          curl.exe -JLO https://aka.ms/wingetcreate/latest
           .\wingetcreate.exe update HTTPToolKit.HTTPToolKit `
             --version $packageVersion `
             --urls "$installerUrl|x64" `
-            --submit `
-            --token "${{ secrets.WINGET_GITHUB_TOKEN }}"
+            --submit
